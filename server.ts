@@ -4,8 +4,28 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import Database from 'better-sqlite3';
 import crypto from 'crypto';
+import { kv } from '@vercel/kv';
+import Redis from 'ioredis';
 
+// Configuration Priorities:
+// 1. REDIS_URL (Standard Redis, e.g., Redis Cloud)
+// 2. KV_REST_API_URL (Vercel KV)
+// 3. SQLite (Local/Fallback)
+
+const redisUrl = process.env.REDIS_URL;
+const useVercelKV = !redisUrl && process.env.KV_REST_API_URL && process.env.KV_REST_API_TOKEN;
+
+// Initialize Redis Client (if REDIS_URL is provided)
+const redisClient = redisUrl ? new Redis(redisUrl) : null;
+
+if (redisClient) {
+  redisClient.on('error', (err) => console.error('Redis Client Error', err));
+  redisClient.on('connect', () => console.log('Connected to Redis'));
+}
+
+// Initialize SQLite (Fallback if no Redis/KV)
 const db = (() => {
+  if (redisClient || useVercelKV) return null;
   try {
     return new Database('database.sqlite');
   } catch (error) {
@@ -14,13 +34,14 @@ const db = (() => {
   }
 })();
 
-// Initialize DB
-db.exec(`
-  CREATE TABLE IF NOT EXISTS app_state (
-    key TEXT PRIMARY KEY,
-    value TEXT
-  )
-`);
+if (db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS app_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+}
 
 const INITIAL_KEYWORDS = [
   "다이어트 식단",
@@ -46,14 +67,37 @@ const INITIAL_KEYWORDS = [
 ];
 
 // Helper to get state
-const getState = (key: string, defaultValue: any) => {
-  const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as { value: string } | undefined;
-  return row ? JSON.parse(row.value) : defaultValue;
+const getState = async (key: string, defaultValue: any) => {
+  try {
+    if (redisClient) {
+      const value = await redisClient.get(key);
+      return value ? JSON.parse(value) : defaultValue;
+    } else if (useVercelKV) {
+      const value = await kv.get(key);
+      return value !== null ? value : defaultValue;
+    } else {
+      const row = db!.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as { value: string } | undefined;
+      return row ? JSON.parse(row.value) : defaultValue;
+    }
+  } catch (error) {
+    console.error(`Error getting state for key ${key}:`, error);
+    return defaultValue;
+  }
 };
 
 // Helper to set state
-const setState = (key: string, value: any) => {
-  db.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)').run(key, JSON.stringify(value));
+const setState = async (key: string, value: any) => {
+  try {
+    if (redisClient) {
+      await redisClient.set(key, JSON.stringify(value));
+    } else if (useVercelKV) {
+      await kv.set(key, value);
+    } else {
+      db!.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)').run(key, JSON.stringify(value));
+    }
+  } catch (error) {
+    console.error(`Error setting state for key ${key}:`, error);
+  }
 };
 
 async function startServer() {
@@ -65,12 +109,12 @@ async function startServer() {
   // API Routes
   
   // Get global state
-  app.get('/api/state', (req, res) => {
+  app.get('/api/state', async (req, res) => {
     try {
-      const keywordGroups = getState('keywordGroups', [
+      const keywordGroups = await getState('keywordGroups', [
         { id: 'default', name: '기본 그룹', keywords: INITIAL_KEYWORDS }
       ]);
-      const influencers = getState('influencers', []);
+      const influencers = await getState('influencers', []);
       res.json({ keywordGroups, influencers });
     } catch (error) {
       console.error('Get state error:', error);
@@ -79,11 +123,11 @@ async function startServer() {
   });
 
   // Save global state
-  app.post('/api/state', (req, res) => {
+  app.post('/api/state', async (req, res) => {
     try {
       const { keywordGroups, influencers } = req.body;
-      if (keywordGroups) setState('keywordGroups', keywordGroups);
-      if (influencers) setState('influencers', influencers);
+      if (keywordGroups) await setState('keywordGroups', keywordGroups);
+      if (influencers) await setState('influencers', influencers);
       res.json({ success: true });
     } catch (error) {
       console.error('Save state error:', error);
