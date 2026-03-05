@@ -1,0 +1,164 @@
+import express from 'express';
+import { createServer as createViteServer } from 'vite';
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import Database from 'better-sqlite3';
+import crypto from 'crypto';
+
+const db = (() => {
+  try {
+    return new Database('database.sqlite');
+  } catch (error) {
+    console.error('Failed to initialize file-based database, falling back to in-memory:', error);
+    return new Database(':memory:');
+  }
+})();
+
+// Initialize DB
+db.exec(`
+  CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  )
+`);
+
+const INITIAL_KEYWORDS = [
+  "다이어트 식단",
+  "뱃살 빼는 운동",
+  "헬스 루틴",
+  "홈트레이닝",
+  "스트레칭",
+  "오운완",
+  "단기간 다이어트",
+  "공복 유산소",
+  "어깨 넓어지는 운동",
+  "힙업 운동",
+  "거북목 스트레칭",
+  "스쿼트 자세",
+  "체지방 줄이는 법",
+  "등 운동 루틴",
+  "전신 유산소 운동",
+  "운동 전후 식사",
+  "기초대사량 높이는 법",
+  "바디프로필",
+  "필라테스 효과",
+  "폼롤러 마사지"
+];
+
+// Helper to get state
+const getState = (key: string, defaultValue: any) => {
+  const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as { value: string } | undefined;
+  return row ? JSON.parse(row.value) : defaultValue;
+};
+
+// Helper to set state
+const setState = (key: string, value: any) => {
+  db.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)').run(key, JSON.stringify(value));
+};
+
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+
+  app.use(express.json({ limit: '50mb' }));
+
+  // API Routes
+  
+  // Get global state
+  app.get('/api/state', (req, res) => {
+    try {
+      const keywordGroups = getState('keywordGroups', [
+        { id: 'default', name: '기본 그룹', keywords: INITIAL_KEYWORDS }
+      ]);
+      const influencers = getState('influencers', []);
+      res.json({ keywordGroups, influencers });
+    } catch (error) {
+      console.error('Get state error:', error);
+      res.status(500).json({ error: 'Failed to get state' });
+    }
+  });
+
+  // Save global state
+  app.post('/api/state', (req, res) => {
+    try {
+      const { keywordGroups, influencers } = req.body;
+      if (keywordGroups) setState('keywordGroups', keywordGroups);
+      if (influencers) setState('influencers', influencers);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('Save state error:', error);
+      res.status(500).json({ error: 'Failed to save state' });
+    }
+  });
+
+  app.get('/api/crawl', async (req, res) => {
+    const keyword = req.query.keyword as string;
+    if (!keyword) {
+      return res.status(400).json({ error: 'Keyword is required' });
+    }
+
+    try {
+      const url = `https://search.naver.com/search.naver?where=influencer&query=${encodeURIComponent(keyword)}`;
+      console.log(`Crawling: ${url}`);
+
+      const response = await axios.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+          'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+          'Referer': 'https://www.naver.com/'
+        }
+      });
+
+      const $ = cheerio.load(response.data);
+      const influencers: any[] = [];
+
+      $('li.keyword_bx').each((_, element) => {
+        const name = $(element).find('.user_info .name .txt').text().trim();
+        let url = $(element).find('.user_info .name').attr('href') || '';
+        
+        // Clean URL (remove query params)
+        if (url.includes('?')) {
+          url = url.split('?')[0];
+        }
+
+        const fans = $(element).find('.user_info .fan_count ._fan_count').text().trim();
+        const specialty = $(element).find('.user_info .etc_area .etc').first().text().trim();
+
+        if (name && url) {
+          influencers.push({
+            id: crypto.randomUUID(),
+            keyword,
+            name,
+            url,
+            fans,
+            specialty
+          });
+        }
+      });
+
+      res.json({ influencers });
+    } catch (error) {
+      console.error('Crawl error:', error);
+      res.status(500).json({ error: 'Failed to crawl data' });
+    }
+  });
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    // Production static file serving (if needed later)
+    app.use(express.static('dist'));
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+startServer();
